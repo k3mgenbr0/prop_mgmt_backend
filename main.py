@@ -1,31 +1,40 @@
 from datetime import date
-from typing import Optional, List, Any
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from typing import Optional, List, Any, Iterable
+import logging
+import re
 
 from fastapi import FastAPI, Depends, HTTPException, Request, Path
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, ConfigDict
 from google.cloud import bigquery
+from google.api_core.exceptions import BadRequest, GoogleAPIError
+
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 # -----------------------------------------------------------------------------
 # App Initialization
 # -----------------------------------------------------------------------------
-# FastAPI automatically provides Swagger docs at /docs
 app = FastAPI(
     title="Property Management API",
-    version="1.0.0",
+    version="1.1.0",
     description="FastAPI backend for Property Management App using BigQuery"
 )
 
 # -----------------------------------------------------------------------------
 # CORS Configuration
 # -----------------------------------------------------------------------------
-# Allows frontend apps to call the API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten this in production if needed
+    allow_origins=["*"],  # tighten this in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -40,6 +49,80 @@ DATASET = "property_mgmt"
 PROPERTIES_TABLE = f"`{PROJECT_ID}.{DATASET}.properties`"
 INCOME_TABLE = f"`{PROJECT_ID}.{DATASET}.income`"
 EXPENSES_TABLE = f"`{PROJECT_ID}.{DATASET}.expenses`"
+
+STATE_REGEX = re.compile(r"^[A-Z]{2}$")
+ZIP_REGEX = re.compile(r"^\d{5}(-\d{4})?$")
+MONEY_PLACES = Decimal("0.01")
+
+
+# -----------------------------------------------------------------------------
+# Money Helpers
+# -----------------------------------------------------------------------------
+def normalize_money(value: Any) -> Decimal:
+    """
+    Convert incoming money values to Decimal rounded to 2 decimal places.
+    This avoids common float precision problems for currency handling.
+    """
+    try:
+        if isinstance(value, Decimal):
+            money = value
+        else:
+            money = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        raise ValueError("Money values must be valid numbers.")
+
+    return money.quantize(MONEY_PLACES, rounding=ROUND_HALF_UP)
+
+
+def money_to_float(value: Any) -> float:
+    return float(normalize_money(value))
+
+
+def format_currency(value: Any) -> str:
+    """
+    Accounting style:
+    1500 -> $1,500.00
+    -1500 -> ($1,500.00)
+    """
+    amount = normalize_money(value)
+
+    if amount < 0:
+        return f"(${abs(amount):,.2f})"
+    return f"${amount:,.2f}"
+
+
+def add_formatted_money_fields(record: dict, money_fields: Iterable[str]) -> dict:
+    """
+    Adds companion display fields for money values.
+    Example: monthly_rent -> monthly_rent_formatted
+    """
+    output = dict(record)
+
+    for field in money_fields:
+        if field in output and output[field] is not None:
+            numeric_value = money_to_float(output[field])
+            output[field] = numeric_value
+            output[f"{field}_formatted"] = format_currency(numeric_value)
+
+    return output
+
+
+# -----------------------------------------------------------------------------
+# Serialization Helpers
+# -----------------------------------------------------------------------------
+def serialize_row(row: dict) -> dict:
+    """
+    Convert BigQuery row values into API-safe Python types.
+    """
+    serialized = {}
+
+    for key, value in row.items():
+        if isinstance(value, Decimal):
+            serialized[key] = float(value)
+        else:
+            serialized[key] = value
+
+    return serialized
 
 
 # -----------------------------------------------------------------------------
@@ -95,6 +178,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled server error: %s", exc)
     return JSONResponse(
         status_code=500,
         content={
@@ -105,9 +189,19 @@ async def generic_exception_handler(request: Request, exc: Exception):
 
 
 # -----------------------------------------------------------------------------
+# Base Model
+# -----------------------------------------------------------------------------
+class APIModel(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={"example": {}},
+        str_strip_whitespace=True
+    )
+
+
+# -----------------------------------------------------------------------------
 # Pydantic Models
 # -----------------------------------------------------------------------------
-class PropertyBase(BaseModel):
+class PropertyBase(APIModel):
     name: str = Field(..., min_length=1, max_length=100, description="Property name")
     address: str = Field(..., min_length=1, max_length=200, description="Street address")
     city: str = Field(..., min_length=1, max_length=100)
@@ -115,7 +209,7 @@ class PropertyBase(BaseModel):
     postal_code: str = Field(..., min_length=5, max_length=10)
     property_type: str = Field(..., min_length=1, max_length=50)
     tenant_name: Optional[str] = Field(None, max_length=100)
-    monthly_rent: float = Field(..., ge=0, description="Monthly rent must be zero or greater")
+    monthly_rent: Decimal = Field(..., ge=0, description="Monthly rent must be zero or greater")
 
     @field_validator("name", "address", "city", "property_type")
     @classmethod
@@ -129,7 +223,7 @@ class PropertyBase(BaseModel):
     @classmethod
     def validate_state(cls, value: str) -> str:
         cleaned = value.strip().upper()
-        if len(cleaned) != 2:
+        if not STATE_REGEX.fullmatch(cleaned):
             raise ValueError("State must be a 2-letter abbreviation like IN.")
         return cleaned
 
@@ -137,8 +231,8 @@ class PropertyBase(BaseModel):
     @classmethod
     def validate_postal_code(cls, value: str) -> str:
         cleaned = value.strip()
-        if not cleaned:
-            raise ValueError("Postal code cannot be blank.")
+        if not ZIP_REGEX.fullmatch(cleaned):
+            raise ValueError("Postal code must be in 12345 or 12345-6789 format.")
         return cleaned
 
     @field_validator("tenant_name")
@@ -149,6 +243,14 @@ class PropertyBase(BaseModel):
         cleaned = value.strip()
         return cleaned or None
 
+    @field_validator("monthly_rent", mode="before")
+    @classmethod
+    def validate_monthly_rent(cls, value: Any) -> Decimal:
+        money = normalize_money(value)
+        if money < 0:
+            raise ValueError("Monthly rent must be zero or greater.")
+        return money
+
 
 class PropertyCreate(PropertyBase):
     pass
@@ -158,14 +260,31 @@ class PropertyUpdate(PropertyBase):
     pass
 
 
-class PropertyOut(PropertyBase):
+class PropertyOut(APIModel):
     property_id: int
+    name: str
+    address: str
+    city: str
+    state: str
+    postal_code: str
+    property_type: str
+    tenant_name: Optional[str]
+    monthly_rent: float
+    monthly_rent_formatted: str
 
 
-class IncomeCreate(BaseModel):
-    amount: float = Field(..., gt=0, description="Income amount must be greater than 0")
+class IncomeCreate(APIModel):
+    amount: Decimal = Field(..., gt=0, description="Income amount must be greater than 0")
     date: date
     description: Optional[str] = Field(None, max_length=250)
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def validate_amount(cls, value: Any) -> Decimal:
+        money = normalize_money(value)
+        if money <= 0:
+            raise ValueError("Income amount must be greater than 0.")
+        return money
 
     @field_validator("description")
     @classmethod
@@ -176,17 +295,29 @@ class IncomeCreate(BaseModel):
         return cleaned or None
 
 
-class IncomeOut(IncomeCreate):
+class IncomeOut(APIModel):
     income_id: int
     property_id: int
+    amount: float
+    amount_formatted: str
+    date: date
+    description: Optional[str]
 
 
-class ExpenseCreate(BaseModel):
-    amount: float = Field(..., gt=0, description="Expense amount must be greater than 0")
+class ExpenseCreate(APIModel):
+    amount: Decimal = Field(..., gt=0, description="Expense amount must be greater than 0")
     date: date
     category: str = Field(..., min_length=1, max_length=100)
     vendor: Optional[str] = Field(None, max_length=100)
     description: Optional[str] = Field(None, max_length=250)
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def validate_amount(cls, value: Any) -> Decimal:
+        money = normalize_money(value)
+        if money <= 0:
+            raise ValueError("Expense amount must be greater than 0.")
+        return money
 
     @field_validator("category")
     @classmethod
@@ -205,19 +336,28 @@ class ExpenseCreate(BaseModel):
         return cleaned or None
 
 
-class ExpenseOut(ExpenseCreate):
+class ExpenseOut(APIModel):
     expense_id: int
     property_id: int
+    amount: float
+    amount_formatted: str
+    date: date
+    category: str
+    vendor: Optional[str]
+    description: Optional[str]
 
 
-class PropertyTotalsOut(BaseModel):
+class PropertyTotalsOut(APIModel):
     property_id: int
     total_income: float
+    total_income_formatted: str
     total_expenses: float
+    total_expenses_formatted: str
     net_cash_flow: float
+    net_cash_flow_formatted: str
 
 
-class PropertySummaryOut(BaseModel):
+class PropertySummaryOut(APIModel):
     property: PropertyOut
     totals: PropertyTotalsOut
 
@@ -225,13 +365,41 @@ class PropertySummaryOut(BaseModel):
 # -----------------------------------------------------------------------------
 # Helper Functions
 # -----------------------------------------------------------------------------
-def run_query(bq: bigquery.Client, query: str, params: Optional[List[Any]] = None):
+def run_query(
+    bq: bigquery.Client,
+    query: str,
+    params: Optional[List[Any]] = None
+):
     job_config = bigquery.QueryJobConfig(query_parameters=params or [])
+
     try:
         return bq.query(query, job_config=job_config).result()
+
     except HTTPException:
         raise
-    except Exception:
+
+    except BadRequest as exc:
+        logger.exception("BigQuery bad request: %s", exc)
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": True,
+                "message": "The database rejected the request. Please check your inputs and try again."
+            }
+        )
+
+    except GoogleAPIError as exc:
+        logger.exception("BigQuery API error: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": True,
+                "message": "The database service is temporarily unavailable. Please try again shortly."
+            }
+        )
+
+    except Exception as exc:
+        logger.exception("Unexpected database error: %s", exc)
         raise HTTPException(
             status_code=500,
             detail={
@@ -241,9 +409,24 @@ def run_query(bq: bigquery.Client, query: str, params: Optional[List[Any]] = Non
         )
 
 
-def fetch_one(bq: bigquery.Client, query: str, params: Optional[List[Any]] = None):
+def fetch_one(
+    bq: bigquery.Client,
+    query: str,
+    params: Optional[List[Any]] = None
+):
     rows = list(run_query(bq, query, params))
-    return dict(rows[0]) if rows else None
+    if not rows:
+        return None
+    return serialize_row(dict(rows[0]))
+
+
+def fetch_all(
+    bq: bigquery.Client,
+    query: str,
+    params: Optional[List[Any]] = None
+) -> List[dict]:
+    rows = run_query(bq, query, params)
+    return [serialize_row(dict(row)) for row in rows]
 
 
 def record_exists(bq: bigquery.Client, table: str, id_field: str, id_value: int) -> bool:
@@ -312,7 +495,7 @@ def get_property_row(bq: bigquery.Client, property_id: int):
             }
         )
 
-    return row
+    return add_formatted_money_fields(row, ["monthly_rent"])
 
 
 def get_property_totals_row(bq: bigquery.Client, property_id: int):
@@ -335,15 +518,29 @@ def get_property_totals_row(bq: bigquery.Client, property_id: int):
     income_row = fetch_one(bq, income_query, params) or {"total_income": 0}
     expense_row = fetch_one(bq, expense_query, params) or {"total_expenses": 0}
 
-    total_income = float(income_row["total_income"])
-    total_expenses = float(expense_row["total_expenses"])
+    total_income = money_to_float(income_row["total_income"])
+    total_expenses = money_to_float(expense_row["total_expenses"])
+    net_cash_flow = total_income - total_expenses
 
-    return {
+    totals = {
         "property_id": property_id,
         "total_income": total_income,
         "total_expenses": total_expenses,
-        "net_cash_flow": total_income - total_expenses
+        "net_cash_flow": money_to_float(net_cash_flow)
     }
+
+    return add_formatted_money_fields(
+        totals,
+        ["total_income", "total_expenses", "net_cash_flow"]
+    )
+
+
+def shape_income_record(record: dict) -> dict:
+    return add_formatted_money_fields(record, ["amount"])
+
+
+def shape_expense_record(record: dict) -> dict:
+    return add_formatted_money_fields(record, ["amount"])
 
 
 # -----------------------------------------------------------------------------
@@ -352,7 +549,8 @@ def get_property_totals_row(bq: bigquery.Client, property_id: int):
 @app.get("/")
 def root():
     return {
-        "message": "Property Management API is running successfully."
+        "message": "Property Management API is running successfully.",
+        "version": app.version
     }
 
 
@@ -366,8 +564,8 @@ def get_properties(bq: bigquery.Client = Depends(get_bq_client)):
         FROM {PROPERTIES_TABLE}
         ORDER BY property_id
     """
-    results = run_query(bq, query)
-    return [dict(row) for row in results]
+    results = fetch_all(bq, query)
+    return [add_formatted_money_fields(row, ["monthly_rent"]) for row in results]
 
 
 @app.get("/properties/{property_id}", response_model=PropertyOut)
@@ -401,14 +599,22 @@ def create_property(payload: PropertyCreate, bq: bigquery.Client = Depends(get_b
         bigquery.ScalarQueryParameter("postal_code", "STRING", payload.postal_code),
         bigquery.ScalarQueryParameter("property_type", "STRING", payload.property_type),
         bigquery.ScalarQueryParameter("tenant_name", "STRING", payload.tenant_name),
-        bigquery.ScalarQueryParameter("monthly_rent", "FLOAT64", payload.monthly_rent),
+        bigquery.ScalarQueryParameter("monthly_rent", "FLOAT64", money_to_float(payload.monthly_rent)),
     ]
 
     run_query(bq, query, params)
 
     return {
         "property_id": property_id,
-        **payload.model_dump()
+        "name": payload.name,
+        "address": payload.address,
+        "city": payload.city,
+        "state": payload.state,
+        "postal_code": payload.postal_code,
+        "property_type": payload.property_type,
+        "tenant_name": payload.tenant_name,
+        "monthly_rent": money_to_float(payload.monthly_rent),
+        "monthly_rent_formatted": format_currency(payload.monthly_rent)
     }
 
 
@@ -446,14 +652,22 @@ def update_property(
         bigquery.ScalarQueryParameter("postal_code", "STRING", payload.postal_code),
         bigquery.ScalarQueryParameter("property_type", "STRING", payload.property_type),
         bigquery.ScalarQueryParameter("tenant_name", "STRING", payload.tenant_name),
-        bigquery.ScalarQueryParameter("monthly_rent", "FLOAT64", payload.monthly_rent),
+        bigquery.ScalarQueryParameter("monthly_rent", "FLOAT64", money_to_float(payload.monthly_rent)),
     ]
 
     run_query(bq, query, params)
 
     return {
         "property_id": property_id,
-        **payload.model_dump()
+        "name": payload.name,
+        "address": payload.address,
+        "city": payload.city,
+        "state": payload.state,
+        "postal_code": payload.postal_code,
+        "property_type": payload.property_type,
+        "tenant_name": payload.tenant_name,
+        "monthly_rent": money_to_float(payload.monthly_rent),
+        "monthly_rent_formatted": format_currency(payload.monthly_rent)
     }
 
 
@@ -507,16 +721,16 @@ def get_income(
         SELECT *
         FROM {INCOME_TABLE}
         WHERE property_id = @property_id
-        ORDER BY income_id
+        ORDER BY date DESC, income_id DESC
     """
 
-    results = run_query(
+    results = fetch_all(
         bq,
         query,
         [bigquery.ScalarQueryParameter("property_id", "INT64", property_id)]
     )
 
-    return [dict(row) for row in results]
+    return [shape_income_record(row) for row in results]
 
 
 @app.post("/income/{property_id}", response_model=IncomeOut, status_code=201)
@@ -538,7 +752,7 @@ def create_income(
     params = [
         bigquery.ScalarQueryParameter("income_id", "INT64", income_id),
         bigquery.ScalarQueryParameter("property_id", "INT64", property_id),
-        bigquery.ScalarQueryParameter("amount", "FLOAT64", payload.amount),
+        bigquery.ScalarQueryParameter("amount", "FLOAT64", money_to_float(payload.amount)),
         bigquery.ScalarQueryParameter("date", "DATE", payload.date),
         bigquery.ScalarQueryParameter("description", "STRING", payload.description),
     ]
@@ -548,7 +762,10 @@ def create_income(
     return {
         "income_id": income_id,
         "property_id": property_id,
-        **payload.model_dump()
+        "amount": money_to_float(payload.amount),
+        "amount_formatted": format_currency(payload.amount),
+        "date": payload.date,
+        "description": payload.description
     }
 
 
@@ -566,16 +783,16 @@ def get_expenses(
         SELECT *
         FROM {EXPENSES_TABLE}
         WHERE property_id = @property_id
-        ORDER BY expense_id
+        ORDER BY date DESC, expense_id DESC
     """
 
-    results = run_query(
+    results = fetch_all(
         bq,
         query,
         [bigquery.ScalarQueryParameter("property_id", "INT64", property_id)]
     )
 
-    return [dict(row) for row in results]
+    return [shape_expense_record(row) for row in results]
 
 
 @app.post("/expenses/{property_id}", response_model=ExpenseOut, status_code=201)
@@ -597,7 +814,7 @@ def create_expense(
     params = [
         bigquery.ScalarQueryParameter("expense_id", "INT64", expense_id),
         bigquery.ScalarQueryParameter("property_id", "INT64", property_id),
-        bigquery.ScalarQueryParameter("amount", "FLOAT64", payload.amount),
+        bigquery.ScalarQueryParameter("amount", "FLOAT64", money_to_float(payload.amount)),
         bigquery.ScalarQueryParameter("date", "DATE", payload.date),
         bigquery.ScalarQueryParameter("category", "STRING", payload.category),
         bigquery.ScalarQueryParameter("vendor", "STRING", payload.vendor),
@@ -609,7 +826,12 @@ def create_expense(
     return {
         "expense_id": expense_id,
         "property_id": property_id,
-        **payload.model_dump()
+        "amount": money_to_float(payload.amount),
+        "amount_formatted": format_currency(payload.amount),
+        "date": payload.date,
+        "category": payload.category,
+        "vendor": payload.vendor,
+        "description": payload.description
     }
 
 
