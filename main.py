@@ -1,6 +1,6 @@
 from datetime import date
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from typing import Optional, List, Any, Iterable
+from typing import Optional, List, Any
 import logging
 import re
 
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 app = FastAPI(
     title="Property Management API",
-    version="1.1.0",
+    version="1.2.0",
     description="FastAPI backend for Property Management App using BigQuery"
 )
 
@@ -59,10 +59,6 @@ MONEY_PLACES = Decimal("0.01")
 # Money Helpers
 # -----------------------------------------------------------------------------
 def normalize_money(value: Any) -> Decimal:
-    """
-    Convert incoming money values to Decimal rounded to 2 decimal places.
-    This avoids common float precision problems for currency handling.
-    """
     try:
         if isinstance(value, Decimal):
             money = value
@@ -79,11 +75,6 @@ def money_to_float(value: Any) -> float:
 
 
 def format_currency(value: Any) -> str:
-    """
-    Accounting style:
-    1500 -> $1,500.00
-    -1500 -> ($1,500.00)
-    """
     amount = normalize_money(value)
 
     if amount < 0:
@@ -91,18 +82,12 @@ def format_currency(value: Any) -> str:
     return f"${amount:,.2f}"
 
 
-def add_formatted_money_fields(record: dict, money_fields: Iterable[str]) -> dict:
-    """
-    Adds companion display fields for money values.
-    Example: monthly_rent -> monthly_rent_formatted
-    """
+def format_money_fields(record: dict, money_fields: List[str]) -> dict:
     output = dict(record)
 
     for field in money_fields:
         if field in output and output[field] is not None:
-            numeric_value = money_to_float(output[field])
-            output[field] = numeric_value
-            output[f"{field}_formatted"] = format_currency(numeric_value)
+            output[field] = format_currency(output[field])
 
     return output
 
@@ -111,9 +96,6 @@ def add_formatted_money_fields(record: dict, money_fields: Iterable[str]) -> dic
 # Serialization Helpers
 # -----------------------------------------------------------------------------
 def serialize_row(row: dict) -> dict:
-    """
-    Convert BigQuery row values into API-safe Python types.
-    """
     serialized = {}
 
     for key, value in row.items():
@@ -269,8 +251,7 @@ class PropertyOut(APIModel):
     postal_code: str
     property_type: str
     tenant_name: Optional[str]
-    monthly_rent: float
-    monthly_rent_formatted: str
+    monthly_rent: str
 
 
 class IncomeCreate(APIModel):
@@ -298,8 +279,7 @@ class IncomeCreate(APIModel):
 class IncomeOut(APIModel):
     income_id: int
     property_id: int
-    amount: float
-    amount_formatted: str
+    amount: str
     date: date
     description: Optional[str]
 
@@ -339,8 +319,7 @@ class ExpenseCreate(APIModel):
 class ExpenseOut(APIModel):
     expense_id: int
     property_id: int
-    amount: float
-    amount_formatted: str
+    amount: str
     date: date
     category: str
     vendor: Optional[str]
@@ -349,12 +328,9 @@ class ExpenseOut(APIModel):
 
 class PropertyTotalsOut(APIModel):
     property_id: int
-    total_income: float
-    total_income_formatted: str
-    total_expenses: float
-    total_expenses_formatted: str
-    net_cash_flow: float
-    net_cash_flow_formatted: str
+    total_income: str
+    total_expenses: str
+    net_cash_flow: str
 
 
 class PropertySummaryOut(APIModel):
@@ -495,7 +471,7 @@ def get_property_row(bq: bigquery.Client, property_id: int):
             }
         )
 
-    return add_formatted_money_fields(row, ["monthly_rent"])
+    return format_money_fields(row, ["monthly_rent"])
 
 
 def get_property_totals_row(bq: bigquery.Client, property_id: int):
@@ -526,21 +502,21 @@ def get_property_totals_row(bq: bigquery.Client, property_id: int):
         "property_id": property_id,
         "total_income": total_income,
         "total_expenses": total_expenses,
-        "net_cash_flow": money_to_float(net_cash_flow)
+        "net_cash_flow": net_cash_flow
     }
 
-    return add_formatted_money_fields(
+    return format_money_fields(
         totals,
         ["total_income", "total_expenses", "net_cash_flow"]
     )
 
 
 def shape_income_record(record: dict) -> dict:
-    return add_formatted_money_fields(record, ["amount"])
+    return format_money_fields(record, ["amount"])
 
 
 def shape_expense_record(record: dict) -> dict:
-    return add_formatted_money_fields(record, ["amount"])
+    return format_money_fields(record, ["amount"])
 
 
 # -----------------------------------------------------------------------------
@@ -565,7 +541,7 @@ def get_properties(bq: bigquery.Client = Depends(get_bq_client)):
         ORDER BY property_id
     """
     results = fetch_all(bq, query)
-    return [add_formatted_money_fields(row, ["monthly_rent"]) for row in results]
+    return [format_money_fields(row, ["monthly_rent"]) for row in results]
 
 
 @app.get("/properties/{property_id}", response_model=PropertyOut)
@@ -613,8 +589,7 @@ def create_property(payload: PropertyCreate, bq: bigquery.Client = Depends(get_b
         "postal_code": payload.postal_code,
         "property_type": payload.property_type,
         "tenant_name": payload.tenant_name,
-        "monthly_rent": money_to_float(payload.monthly_rent),
-        "monthly_rent_formatted": format_currency(payload.monthly_rent)
+        "monthly_rent": format_currency(payload.monthly_rent)
     }
 
 
@@ -666,8 +641,7 @@ def update_property(
         "postal_code": payload.postal_code,
         "property_type": payload.property_type,
         "tenant_name": payload.tenant_name,
-        "monthly_rent": money_to_float(payload.monthly_rent),
-        "monthly_rent_formatted": format_currency(payload.monthly_rent)
+        "monthly_rent": format_currency(payload.monthly_rent)
     }
 
 
@@ -762,8 +736,7 @@ def create_income(
     return {
         "income_id": income_id,
         "property_id": property_id,
-        "amount": money_to_float(payload.amount),
-        "amount_formatted": format_currency(payload.amount),
+        "amount": format_currency(payload.amount),
         "date": payload.date,
         "description": payload.description
     }
@@ -826,8 +799,7 @@ def create_expense(
     return {
         "expense_id": expense_id,
         "property_id": property_id,
-        "amount": money_to_float(payload.amount),
-        "amount_formatted": format_currency(payload.amount),
+        "amount": format_currency(payload.amount),
         "date": payload.date,
         "category": payload.category,
         "vendor": payload.vendor,
