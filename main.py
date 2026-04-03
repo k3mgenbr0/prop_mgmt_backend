@@ -36,7 +36,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten this in production
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -175,7 +175,6 @@ async def generic_exception_handler(request: Request, exc: Exception):
 # -----------------------------------------------------------------------------
 class APIModel(BaseModel):
     model_config = ConfigDict(
-        json_schema_extra={"example": {}},
         str_strip_whitespace=True
     )
 
@@ -235,11 +234,37 @@ class PropertyBase(APIModel):
 
 
 class PropertyCreate(PropertyBase):
-    pass
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "name": "Maple Grove Apartments",
+                "address": "123 Main Street",
+                "city": "Indianapolis",
+                "state": "IN",
+                "postal_code": "46204",
+                "property_type": "Apartment",
+                "tenant_name": "John Smith",
+                "monthly_rent": 1450.00
+            }
+        }
+    )
 
 
 class PropertyUpdate(PropertyBase):
-    pass
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "name": "Maple Grove Apartments",
+                "address": "123 Main Street",
+                "city": "Indianapolis",
+                "state": "IN",
+                "postal_code": "46204",
+                "property_type": "Apartment",
+                "tenant_name": "Jane Doe",
+                "monthly_rent": 1500.00
+            }
+        }
+    )
 
 
 class PropertyOut(APIModel):
@@ -258,6 +283,16 @@ class IncomeCreate(APIModel):
     amount: Decimal = Field(..., gt=0, description="Income amount must be greater than 0")
     date: date
     description: Optional[str] = Field(None, max_length=250)
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "amount": 1450.00,
+                "date": "2026-04-03",
+                "description": "April rent payment"
+            }
+        }
+    )
 
     @field_validator("amount", mode="before")
     @classmethod
@@ -290,6 +325,18 @@ class ExpenseCreate(APIModel):
     category: str = Field(..., min_length=1, max_length=100)
     vendor: Optional[str] = Field(None, max_length=100)
     description: Optional[str] = Field(None, max_length=250)
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "amount": 250.75,
+                "date": "2026-04-03",
+                "category": "Maintenance",
+                "vendor": "Ace Hardware",
+                "description": "Plumbing repair supplies"
+            }
+        }
+    )
 
     @field_validator("amount", mode="before")
     @classmethod
@@ -526,7 +573,12 @@ def shape_expense_record(record: dict) -> dict:
 def root():
     return {
         "message": "Property Management API is running successfully.",
-        "version": app.version
+        "version": app.version,
+        "storage": "BigQuery",
+        "deployment": "Google Cloud Run",
+        "docs_url": "/docs",
+        "cors_enabled": True,
+        "json_responses": True
     }
 
 
